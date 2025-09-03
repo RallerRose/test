@@ -1,0 +1,138 @@
+/************* Indstillinger til forbedret styring *************/
+const float SENSOR_ANGLE_DEG = 30.0;   // vinkel side-sensor peger fremad (typisk 20–35°)
+const int   BASE = 120;                // grundfart (0–255)
+const float Kp   = 4.0;                // proportional gevinst til vægfølgning
+const float Kd   = 10.0;               // dæmpning (kan sættes 0 for at starte simpelt)
+
+const int   HARD_FRONT_STOP = 18;      // direkte ind i væg -> spin turn
+const int   SIDE_PANIC      = 10;      // ultra tæt på side (perpendikulært)
+const int   MAX_PWM         = 255;
+
+unsigned long lastSenseMs = 0;
+const unsigned long senseIntervalMs = 60; // lidt hurtigere respons
+
+// simple EMA-filter for at stabilisere ultralyd
+static float filtF = 999, filtL = 999, filtR = 999;
+const float ALPHA = 0.35;              // 0..1 (højere = hurtigere, mere støj)
+
+inline int clamp(int v, int lo, int hi){ return v<lo?lo:(v>hi?hi:v); }
+
+float ema(float prev, float x) {
+  if (prev > 900 && x < 900) return x; // hurtig init når vi går fra "ingen måling"
+  return ALPHA * x + (1.0 - ALPHA) * prev;
+}
+
+// spin-turn helpers (kort og konsekvent)
+void spinRight(uint16_t ms){
+  // højre baglæns, venstre frem -> drej mod højre
+  turnRight();
+  setSpeed(150, 150);
+  delay(ms);
+  stopAll();
+}
+
+void spinLeft(uint16_t ms){
+  // venstre baglæns, højre frem -> drej mod venstre
+  turnLeft();
+  setSpeed(150, 150);
+  delay(ms);
+  stopAll();
+}
+
+void gentleForward(int left, int right){
+  forward();                 // begge hjul frem
+  setSpeed(right, left);     // HUSK: setSpeed(right, left)
+}
+
+/************* Hovedlogik (ny) *************/
+void loop() {
+  // sanserate
+  if (millis() - lastSenseMs < senseIntervalMs) return;
+  lastSenseMs = millis();
+
+  // 1) Læs sensorer (som i din kode)
+  int cmF = readDistanceCm(trigPinFront, echoPinFront);
+  int cmL = readDistanceCm(trigPinLeft,  echoPinLeft);
+  int cmR = readDistanceCm(trigPinRight, echoPinRight);
+
+  // 2) Filtrer (EMA)
+  filtF = ema(filtF, cmF);
+  filtL = ema(filtL, cmL);
+  filtR = ema(filtR, cmR);
+
+  // 3) Projektion pga. skråt monterede side-sensorer
+  //    Hvis side-sensor peger θ grader fra fremad-retning mod siden:
+  //    Perpendikulær afstand til væg ≈ d_meas * sin(θ)
+  //    Fremad-clearance langs samme retning ≈ d_meas * cos(θ) (kan bruges til heuristik)
+  float sinA = sin(SENSOR_ANGLE_DEG * PI / 180.0);
+  float cosA = cos(SENSOR_ANGLE_DEG * PI / 180.0);
+
+  float right_perp  = filtR * sinA;  // "ægte" afstand til højre væg
+  float left_perp   = filtL * sinA;  // "ægte" afstand til venstre væg
+  float right_fwd   = filtR * cosA;  // fremad komponent for højre sensor
+  float left_fwd    = filtL * cosA;  // fremad komponent for venstre sensor
+
+  // 4) PRINT (debug)
+  Serial.print("F:"); Serial.print((int)filtF);
+  Serial.print("  Rm:"); Serial.print((int)filtR);
+  Serial.print("  R⊥:"); Serial.print((int)right_perp);
+  Serial.print("  Lm:"); Serial.print((int)filtL);
+  Serial.print("  L⊥:"); Serial.print((int)left_perp);
+  Serial.println();
+
+  // 5) Nød-situationer (SPIN TURNS)
+  // Direkte ind i en væg: brug front + også heuristik hvis en skrå side-sensor "ser" en meget nær forhindring langs fremad-retningen
+  bool headOn = (filtF < HARD_FRONT_STOP) ||
+                (right_fwd < HARD_FRONT_STOP && left_fwd < HARD_FRONT_STOP);
+
+  if (headOn) {
+    // Stop, træk lidt tilbage og vælg spin-retning væk fra den korteste side
+    stopAll();
+    delay(120);
+    backward();
+    setSpeed(140,140);
+    delay(280);
+    stopAll();
+
+    if (filtL < filtR) {
+      // mere tæt venstre -> spin til højre
+      spinRight(260);
+    } else {
+      // mere tæt højre -> spin til venstre
+      spinLeft(260);
+    }
+    return; // afslut dette loop-tick
+  }
+
+  // Hvis vi er farligt tæt på en sidevæg, men ikke direkte frontkollision -> lille spin-impuls væk fra siden
+  if (right_perp < SIDE_PANIC) {
+    spinLeft(160);
+    return;
+  }
+  if (left_perp < SIDE_PANIC) {
+    spinRight(160);
+    return;
+  }
+
+  // 6) NORMAL VÆGFØLGNING (små korrektioner)
+  // Vi følger HØJRE væg. Brug PD-styring på perpendikulær afstand.
+  static float lastErr = 0;
+  float err = (float)targetDistance - right_perp;   // positiv hvis vi er for langt fra væggen (ønsker drej mod højre)
+  float derr = err - lastErr;
+  lastErr = err;
+
+  float turn = Kp * err + Kd * derr;
+
+  // Byg differential PWM (begge frem)
+  int rightPWM = clamp((int)(BASE - turn), 0, MAX_PWM);
+  int leftPWM  = clamp((int)(BASE + turn), 0, MAX_PWM);
+
+  // Lidt ekstra heuristik:
+  // Hvis fronten er moderat tæt (men ikke spin-kritisk), bias en anelse væk fra fronten
+  if (filtF < 30) {
+    rightPWM = clamp(rightPWM - 10, 0, MAX_PWM);
+    leftPWM  = clamp(leftPWM  + 10, 0, MAX_PWM);
+  }
+
+  gentleForward(leftPWM, rightPWM);
+}
