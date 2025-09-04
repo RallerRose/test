@@ -1,138 +1,261 @@
-/************* Indstillinger til forbedret styring *************/
-const float SENSOR_ANGLE_DEG = 30.0;   // vinkel side-sensor peger fremad (typisk 20–35°)
-const int   BASE = 120;                // grundfart (0–255)
-const float Kp   = 4.0;                // proportional gevinst til vægfølgning
-const float Kd   = 10.0;               // dæmpning (kan sættes 0 for at starte simpelt)
+#include <Arduino.h>
 
-const int   HARD_FRONT_STOP = 18;      // direkte ind i væg -> spin turn
-const int   SIDE_PANIC      = 10;      // ultra tæt på side (perpendikulært)
-const int   MAX_PWM         = 255;
+/************* Pins *************/
+// Front
+const int trigPinFront = 18;
+const int echoPinFront = 35;   // INPUT-only (ESP32)
 
-unsigned long lastSenseMs = 0;
-const unsigned long senseIntervalMs = 60; // lidt hurtigere respons
+// Venstre (NY – 90° mod væg)
+const int trigPinLeft90 = 4;   // TRIG (OUTPUT)
+const int echoPinLeft90 = 34;  // INPUT-only (ESP32, 3.3V max)
 
-// simple EMA-filter for at stabilisere ultralyd
-static float filtF = 999, filtL = 999, filtR = 999;
-const float ALPHA = 0.35;              // 0..1 (højere = hurtigere, mere støj)
+// (Valgfrie/log pins — ikke brugt i styring, men beholdes)
+const int trigPinLeft  = 17;
+const int echoPinLeft  = 16;
+const int trigPinRight = 23;
+const int echoPinRight = 22;
 
-inline int clamp(int v, int lo, int hi){ return v<lo?lo:(v>hi?hi:v); }
+// Motorer (L298N / H-bridge)
+const int ENA = 26;  // Højre PWM
+const int IN1 = 14;  // Højre retning
+const int IN2 = 12;  // (strap-pin på nogle ESP32 — hold lav ved boot)
+const int ENB = 25;  // Venstre PWM
+const int IN3 = 27;  // Venstre retning
+const int IN4 = 13;
 
-float ema(float prev, float x) {
-  if (prev > 900 && x < 900) return x; // hurtig init når vi går fra "ingen måling"
-  return ALPHA * x + (1.0 - ALPHA) * prev;
+// Encodere (LM393)
+const int encLeftPin  = 32;  // venstre hjul
+const int encRightPin = 33;  // højre hjul
+
+/************* Parametre *************/
+const int TARGET_SIDE_CM   = 10; // ønsket afstand til venstre væg
+const int FRONT_TURN_CM    = 15; // under dette → 90° højresving
+const int FRONT_SLOW_CM    = 30; // under dette → skaler basisfart
+const int MAX_PWM          = 255;
+
+// Små faste trims (gør højre lidt langsommere)
+const int LEFT_TRIM  = 0;
+const int RIGHT_TRIM = 8;   // 5–12 typisk
+
+// Grundhastigheder
+int baseLeft  = 140;
+int baseRight = 145;
+
+// Sidekorrektion (P)
+// Sidekorrektion (PD i stedet for ren P)
+float Kp = 4.5f;     // var 3.0 — mere “bid”
+float Kd = 2.0f;     // ny D-led, dæmper zig-zag
+const int CORR_MAX = 80; // var 50 — tillad større drejekorrektion
+
+
+/************* Geometri til 90°-sving *************/
+const float wheelDiameter_mm = 65.0f;
+const float ticksPerRev      = 40.0f;        // sæt korrekt for jeres encoder
+const float TRACK_MM         = 120.0f;       // mål hjulafstand (midt–midt)
+const float mmPerTick        = (PI * wheelDiameter_mm) / ticksPerRev;
+// Teori: arc for 90° pivot = pi*TRACK/4
+const int   TICKS_TURN_90    = (int)round((TRACK_MM / (4.0f * wheelDiameter_mm)) * ticksPerRev);
+
+/************* Encoder / hastighed *************/
+volatile uint32_t ticksL = 0, ticksR = 0;
+volatile uint32_t lastTickL_us = 0, lastTickR_us = 0;
+const uint32_t minTickSpacingUs = 300;
+
+unsigned long lastSpeedMs = 0;
+uint32_t prevTL = 0, prevTR = 0;
+float vL_f = 0, vR_f = 0;
+const float VEL_ALPHA = 0.5f;
+
+// PI-match (gør venstre/højre lige hurtige)
+float Kv = 3.0f;   // P-gain (cm/s → PWM)
+float Ki = 0.8f;   // I-gain
+float bias = 0.0f; // +bias: højre er hurtigere → træk fra højre, læg til venstre
+const float BIAS_MAX = 25.0f;
+const int   BIAS_SLEW = 5;
+
+/************* Utils *************/
+int clamp(int v, int lo, int hi){ return v<lo?lo:(v>hi?hi:v); }
+int slew(int cur, int tgt, int step){ if (tgt>cur) return min(tgt,cur+step); if (tgt<cur) return max(tgt,cur-step); return cur; }
+
+/************* Encoders ISR *************/
+void IRAM_ATTR isrEncLeft()  {
+  uint32_t n = micros();
+  if (n - lastTickL_us >= minTickSpacingUs) { ticksL++; lastTickL_us = n; }
+}
+void IRAM_ATTR isrEncRight() {
+  uint32_t n = micros();
+  if (n - lastTickR_us >= minTickSpacingUs) { ticksR++; lastTickR_us = n; }
 }
 
-// spin-turn helpers (kort og konsekvent)
-void spinRight(uint16_t ms){
-  // højre baglæns, venstre frem -> drej mod højre
-  turnRight();
-  setSpeed(150, 150);
-  delay(ms);
+/************* Ultralyd *************/
+int readUltrasonicCM(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH); delayMicroseconds(8);
+  digitalWrite(trigPin, LOW);
+  unsigned long us = pulseIn(echoPin, HIGH, 30000UL);
+  if (us == 0) return 400;       // intet ekko
+  return (int)((us * 0.5f) / 29.412f + 0.5f);
+}
+
+/************* Motorstyring (uden LEDC) *************/
+void setRightMotor(int pwm, bool forward) {
+  pwm = clamp(pwm, 0, MAX_PWM);
+  // retning
+  digitalWrite(IN1, forward ? LOW : HIGH);
+  digitalWrite(IN2, forward ? HIGH : LOW);
+  // hastighed
+  analogWrite(ENA, pwm);
+}
+void setLeftMotor(int pwm, bool forward) {
+  pwm = clamp(pwm, 0, MAX_PWM);
+  // retning (venstre er “inverteret” ift. højre i dit setup)
+  digitalWrite(IN3, forward ? HIGH : LOW);
+  digitalWrite(IN4, forward ? LOW  : HIGH);
+  analogWrite(ENB, pwm);
+}
+void stopAll() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  // valgfri bremse:
+  // digitalWrite(IN1, HIGH); digitalWrite(IN2, HIGH);
+  // digitalWrite(IN3, HIGH); digitalWrite(IN4, HIGH);
+}
+
+/************* Køre-funktioner *************/
+void forwardDrive(int pwmL, int pwmR) {
+  setLeftMotor (pwmL, true);
+  setRightMotor(pwmR, true);
+}
+void spinRight(int pwm = 170) {  // venstre frem, højre tilbage
+  setLeftMotor (pwm, true);
+  setRightMotor(pwm, false);
+}
+
+/************* 90° højresving m. encodere *************/
+void turnRight90() {
+  bias = 0.0f;
+  noInterrupts(); uint32_t startL = ticksL, startR = ticksR; interrupts();
+  const int pwmTurn = 190;
+
+  // start spin
+  setLeftMotor (pwmTurn, true);   // venstre frem
+  setRightMotor(pwmTurn, false);  // højre baglæns
+
+  const uint32_t timeoutMs = 2500;
+  uint32_t t0 = millis();
+  while (true) {
+    noInterrupts(); uint32_t dL = ticksL - startL, dR = ticksR - startR; interrupts();
+    if (dL >= (uint32_t)TICKS_TURN_90 && dR >= (uint32_t)TICKS_TURN_90) break;
+    if (millis() - t0 > timeoutMs) break;
+    delay(5);
+  }
+
+  stopAll(); delay(60);
+
+  // “fald i hak”
+  forwardDrive(clamp(baseLeft, 80, 230), clamp(baseRight, 80, 230));
+  delay(120);
+}
+
+/************* Hastigheds-PI (opdater ~10 Hz) *************/
+void updateSpeedPI() {
+  unsigned long now = millis();
+  if (now - lastSpeedMs < 100) return;
+  uint32_t dMs = now - lastSpeedMs; lastSpeedMs = now;
+
+  noInterrupts(); uint32_t tL = ticksL, tR = ticksR; interrupts();
+  uint32_t dTL = tL - prevTL, dTR = tR - prevTR; prevTL = tL; prevTR = tR;
+
+  float vL = (dMs > 0) ? ((dTL * mmPerTick) / 10.0f) / (dMs / 1000.0f) : 0.0f;
+  float vR = (dMs > 0) ? ((dTR * mmPerTick) / 10.0f) / (dMs / 1000.0f) : 0.0f;
+  vL_f = (1.0f - VEL_ALPHA) * vL_f + VEL_ALPHA * vL;
+  vR_f = (1.0f - VEL_ALPHA) * vR_f + VEL_ALPHA * vR;
+
+  // eV > 0 ⇒ højre hurtigere end venstre
+  float eV = vR_f - vL_f;
+
+  static float I = 0.0f;
+  I += eV * (dMs / 1000.0f);
+  float maxI = (BIAS_MAX) / max(0.001f, Ki);
+  I = constrain(I, -maxI, maxI);
+
+  float biasTarget = Kv * eV + Ki * I;
+  biasTarget = constrain(biasTarget, -BIAS_MAX, BIAS_MAX);
+
+  int cur = (int)round(bias);
+  int tgt = (int)round(biasTarget);
+  bias = (float)slew(cur, tgt, BIAS_SLEW);
+
+  // Debug (valgfri)
+  // Serial.printf("vR=%.1f vL=%.1f eV=%.2f bias=%.1f\n", vR_f, vL_f, eV, bias);
+}
+
+/************* Setup *************/
+void setup() {
+  Serial.begin(115200);
+
+  // Sensorpins
+  pinMode(trigPinFront, OUTPUT);
+  pinMode(echoPinFront, INPUT);
+  pinMode(trigPinLeft90, OUTPUT);
+  pinMode(echoPinLeft90, INPUT);
+
+  // (valgfri log)
+  pinMode(trigPinLeft,  OUTPUT); pinMode(echoPinLeft,  INPUT);
+  pinMode(trigPinRight, OUTPUT); pinMode(echoPinRight, INPUT);
+
+  // Motorretning
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  // Sørg for sikre niveauer ved boot (vigtigt for GPIO12)
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
   stopAll();
+  delay(150);
+
+  // Encodere
+  pinMode(encLeftPin,  INPUT_PULLUP);
+  pinMode(encRightPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(encLeftPin),  isrEncLeft,  RISING);
+  attachInterrupt(digitalPinToInterrupt(encRightPin), isrEncRight, RISING);
+
+  lastSpeedMs = millis();
+
+  Serial.println("Start OK (no LEDC)");
 }
 
-void spinLeft(uint16_t ms){
-  // venstre baglæns, højre frem -> drej mod venstre
-  turnLeft();
-  setSpeed(150, 150);
-  delay(ms);
-  stopAll();
-}
+// --- PD-styring state ---
+float prevErr = 0.0f;
+unsigned long lastCtrlMs = 0;
 
-void gentleForward(int left, int right){
-  forward();                 // begge hjul frem
-  setSpeed(right, left);     // HUSK: setSpeed(right, left)
-}
 
-/************* Hovedlogik (ny) *************/
+/************* Loop *************/
 void loop() {
-  // sanserate
-  if (millis() - lastSenseMs < senseIntervalMs) return;
-  lastSenseMs = millis();
+  // 1) Læs sensorer
+  int f = readUltrasonicCM(trigPinFront,  echoPinFront);
+  int s = readUltrasonicCM(trigPinLeft90, echoPinLeft90);
 
-  // 1) Læs sensorer (som i din kode)
-  int cmF = readDistanceCm(trigPinFront, echoPinFront);
-  int cmL = readDistanceCm(trigPinLeft,  echoPinLeft);
-  int cmR = readDistanceCm(trigPinRight, echoPinRight);
-
-  // 2) Filtrer (EMA)
-  filtF = ema(filtF, cmF);
-  filtL = ema(filtL, cmL);
-  filtR = ema(filtR, cmR);
-
-  // 3) Projektion pga. skråt monterede side-sensorer
-  //    Hvis side-sensor peger θ grader fra fremad-retning mod siden:
-  //    Perpendikulær afstand til væg ≈ d_meas * sin(θ)
-  //    Fremad-clearance langs samme retning ≈ d_meas * cos(θ) (kan bruges til heuristik)
-  float sinA = sin(SENSOR_ANGLE_DEG * PI / 180.0);
-  float cosA = cos(SENSOR_ANGLE_DEG * PI / 180.0);
-
-  float right_perp  = filtR * sinA;  // "ægte" afstand til højre væg
-  float left_perp   = filtL * sinA;  // "ægte" afstand til venstre væg
-  float right_fwd   = filtR * cosA;  // fremad komponent for højre sensor
-  float left_fwd    = filtL * cosA;  // fremad komponent for venstre sensor
-
-  // 4) PRINT (debug)
-  Serial.print("F:"); Serial.print((int)filtF);
-  Serial.print("  Rm:"); Serial.print((int)filtR);
-  Serial.print("  R⊥:"); Serial.print((int)right_perp);
-  Serial.print("  Lm:"); Serial.print((int)filtL);
-  Serial.print("  L⊥:"); Serial.print((int)left_perp);
-  Serial.println();
-
-  // 5) Nød-situationer (SPIN TURNS)
-  // Direkte ind i en væg: brug front + også heuristik hvis en skrå side-sensor "ser" en meget nær forhindring langs fremad-retningen
-  bool headOn = (filtF < HARD_FRONT_STOP) ||
-                (right_fwd < HARD_FRONT_STOP && left_fwd < HARD_FRONT_STOP);
-
-  if (headOn) {
-    // Stop, træk lidt tilbage og vælg spin-retning væk fra den korteste side
-    stopAll();
-    delay(120);
-    backward();
-    setSpeed(140,140);
-    delay(280);
-    stopAll();
-
-    if (filtL < filtR) {
-      // mere tæt venstre -> spin til højre
-      spinRight(260);
-    } else {
-      // mere tæt højre -> spin til venstre
-      spinLeft(260);
-    }
-    return; // afslut dette loop-tick
-  }
-
-  // Hvis vi er farligt tæt på en sidevæg, men ikke direkte frontkollision -> lille spin-impuls væk fra siden
-  if (right_perp < SIDE_PANIC) {
-    spinLeft(160);
-    return;
-  }
-  if (left_perp < SIDE_PANIC) {
-    spinRight(160);
+  // 2) Kun 90° højresving når fronten er tæt
+  if (f < FRONT_TURN_CM) {
+    Serial.println("[TURN] 90 deg right");
+    stopAll(); delay(40);
+    turnRight90();
     return;
   }
 
-  // 6) NORMAL VÆGFØLGNING (små korrektioner)
-  // Vi følger HØJRE væg. Brug PD-styring på perpendikulær afstand.
-  static float lastErr = 0;
-  float err = (float)targetDistance - right_perp;   // positiv hvis vi er for langt fra væggen (ønsker drej mod højre)
-  float derr = err - lastErr;
-  lastErr = err;
+  // 3) Opdater hastigheds-PI (holder den lige)
+  updateSpeedPI();
 
-  float turn = Kp * err + Kd * derr;
-
-  // Byg differential PWM (begge frem)
-  int rightPWM = clamp((int)(BASE - turn), 0, MAX_PWM);
-  int leftPWM  = clamp((int)(BASE + turn), 0, MAX_PWM);
-
-  // Lidt ekstra heuristik:
-  // Hvis fronten er moderat tæt (men ikke spin-kritisk), bias en anelse væk fra fronten
-  if (filtF < 30) {
-    rightPWM = clamp(rightPWM - 10, 0, MAX_PWM);
-    leftPWM  = clamp(leftPWM  + 10, 0, MAX_PWM);
+  // 4) Evt. fartnedskalering hvis noget er foran (uden at bakke)
+  if (f < FRONT_SLOW_CM) {
+    int lo = FRONT_TURN_CM, hi = FRONT_SLOW_CM;
+    int cl = clamp(f, lo, hi);
+    int minCruise = 100;
+    int scale = minCruise + (int)((long)(cl - lo) * (max(baseLeft, baseRight) - minCruise) / (hi - lo));
+    int baseL = clamp(scale, 80, 230);
+    int baseR = clamp(scale, 80, 230);
   }
 
-  gentleForward(leftPWM, rightPWM);
+  
 }
